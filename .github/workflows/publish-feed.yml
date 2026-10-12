@@ -1,0 +1,119 @@
+# Collect the "snapshot" release .apk files of every package repo, sign them
+# and a per-arch packages.adb with APK_SIGNING_KEY, and deploy to GitHub Pages:
+#   https://<owner>.github.io/openwrt-pkgs/<series>/<arch>/packages.adb
+name: publish-feed
+
+on:
+  repository_dispatch:
+    types: [package-updated]
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  PACKAGE_REPOS: sochinorth/routebot sochinorth/omnidns
+  SERIES: '25.12'  # keep in sync with OPENWRT_RELEASE in build-package.yml
+  KEY_NAME: sochinorth  # public key committed as <KEY_NAME>.pem in this repo
+  ALPINE_IMAGE: alpine:3.24  # only used for its apk-tools v3
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Collect packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          for repo in $PACKAGE_REPOS; do
+            gh release download snapshot -R "$repo" -p '*.apk' -D "dl/${repo#*/}" ||
+              echo "::warning::$repo has no snapshot release yet"
+          done
+          for f in dl/*/*__*.apk; do
+            [ -e "$f" ] || continue
+            name=$(basename "$f")
+            mkdir -p "site/$SERIES/${name%%__*}"
+            cp "$f" "site/$SERIES/${name%%__*}/${name#*__}"
+          done
+          [ -d "site/$SERIES" ] || { echo "::error::no packages found"; exit 1; }
+          find site -type f | sort
+
+      - name: Sign packages and indexes
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -eu
+          [ -n "$APK_SIGNING_KEY" ] || { echo "::error::APK_SIGNING_KEY secret is not set"; exit 1; }
+          keys=$RUNNER_TEMP/keys
+          mkdir -m 700 "$keys"
+          (umask 077; printf '%s\n' "$APK_SIGNING_KEY" > "$keys/private.pem")
+          if [ "$(openssl ec -in "$keys/private.pem" -pubout 2>/dev/null)" != "$(cat "repo/$KEY_NAME.pem")" ]; then
+            echo "::error::APK_SIGNING_KEY does not match $KEY_NAME.pem"; exit 1
+          fi
+          cp "repo/$KEY_NAME.pem" site/
+          mkdir "$keys/pub"
+          cp "repo/$KEY_NAME.pem" "$keys/pub/"
+
+          # adbsign only signs the first file it is given, hence one call per file
+          docker run --rm -e OWNER="$(id -u):$(id -g)" \
+            -v "$PWD/site:/site" -v "$keys:/keys:ro" -w /site \
+            "$ALPINE_IMAGE" sh -euc '
+              for d in */*/; do
+                cd "/site/$d"
+                for f in *.apk; do
+                  apk adbsign --allow-untrusted --sign-key /keys/private.pem "$f"
+                done
+                apk mkndx --allow-untrusted --sign-key /keys/private.pem --output packages.adb *.apk
+                apk --keys-dir /keys/pub verify packages.adb *.apk
+              done
+              chown -R "$OWNER" /site'
+          rm -rf "$keys"
+
+      - name: Render index page
+        run: |
+          set -eu
+          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          {
+            echo "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            echo "<title>OpenWrt feed</title>"
+            echo "<style>body{font:15px/1.5 system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem}pre{background:#8881;padding:.75rem;overflow-x:auto}</style>"
+            echo "<h1>OpenWrt $SERIES package feed</h1>"
+            echo "<p>Packages: $(echo $PACKAGE_REPOS | sed 's|[^ ]*/||g'). Built from each repo's default branch.</p>"
+            echo "<h2>Setup</h2><pre>wget -O /etc/apk/keys/$KEY_NAME.pem $base/$KEY_NAME.pem"
+            echo "echo \"$base/$SERIES/\$(cat /etc/apk/arch)/packages.adb\" &gt;&gt; /etc/apk/repositories.d/customfeeds.list"
+            echo "apk update</pre>"
+            echo "<h2>Architectures</h2><ul>"
+            for d in site/$SERIES/*/; do
+              arch=$(basename "$d")
+              pkgs=$(cd "$d" && ls *.apk | sed 's/\.apk$//' | tr '\n' ' ')
+              echo "<li><a href='$SERIES/$arch/'>$arch</a>: $pkgs</li>"
+            done
+            echo "</ul><p>Built $(date -u '+%Y-%m-%d %H:%M UTC').</p>"
+          } > site/index.html
+          # directory listings so the arch links are browsable
+          for d in site/$SERIES/*/; do
+            (cd "$d" && { echo "<!doctype html><meta charset=utf-8><ul>"; for f in *.apk packages.adb; do echo "<li><a href='$f'>$f</a></li>"; done; echo "</ul>"; } > index.html)
+          done
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

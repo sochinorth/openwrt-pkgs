@@ -1,0 +1,170 @@
+# Reusable workflow: build one OpenWrt package with the SDK for every arch
+# below, and (optionally) publish the .apk files to a rolling "snapshot"
+# release on the calling repo, then ask the feed repo to republish.
+#
+# Caller example (in sochinorth/routebot):
+#   jobs:
+#     openwrt:
+#       uses: sochinorth/openwrt-pkgs/.github/workflows/build-package.yml@main
+#       with: { package: routebot, path: openwrt/routebot }
+#       secrets: inherit
+#
+# Packages are unsigned here; the feed repo signs them together with the index.
+name: build-package
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: PKG_NAME of the package
+        required: true
+        type: string
+      path:
+        description: Directory holding the package Makefile, relative to the repo root
+        required: true
+        type: string
+      publish:
+        description: On pushes to the default branch, upload to the "snapshot" release and notify the feed
+        type: boolean
+        default: true
+      feed-repo:
+        description: Feed repo to notify (default <owner>/openwrt-pkgs)
+        type: string
+        default: ''
+    secrets:
+      FEED_TOKEN:
+        description: PAT allowed to send repository_dispatch to feed-repo (Contents read/write)
+        required: false
+
+env:
+  OPENWRT_RELEASE: 25.12.5
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # one SDK per package arch; any target with the same arch would do
+        include:
+          - { arch: mipsel_24kc,              target: ramips/mt7621 }
+          - { arch: mips_24kc,                target: ath79/generic }
+          - { arch: aarch64_cortex-a53,       target: mediatek/filogic }
+          - { arch: aarch64_cortex-a72,       target: bcm27xx/bcm2711 }
+          - { arch: aarch64_generic,          target: armsr/armv8 }
+          - { arch: arm_cortex-a7_neon-vfpv4, target: ipq40xx/generic }
+          - { arch: x86_64,                   target: x86/64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 0  # PKG_RELEASE = commit count
+
+      - name: Locate SDK
+        id: sdk
+        run: |
+          base=https://downloads.openwrt.org/releases/$OPENWRT_RELEASE/targets/${{ matrix.target }}
+          line=$(curl -fsSL "$base/sha256sums" | grep -E ' \*?openwrt-sdk-.*\.tar\.(zst|xz)$')
+          file=$(echo "$line" | sed -E 's/.* \*?//')
+          echo "url=$base/$file" >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "sha256=${line%% *}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.sdk.outputs.file }}
+          key: sdk-${{ steps.sdk.outputs.sha256 }}
+
+      - name: Fetch and unpack SDK
+        run: |
+          f=${{ steps.sdk.outputs.file }}
+          [ -f "$f" ] || curl -fsSL -o "$f" "${{ steps.sdk.outputs.url }}"
+          echo "${{ steps.sdk.outputs.sha256 }} *$f" | sha256sum -c -
+          mkdir sdk
+          tar -xf "$f" -C sdk --strip-components=1
+
+      - name: Build
+        env:
+          PKG: ${{ inputs.package }}
+          PKG_PATH: ${{ inputs.path }}
+        run: |
+          set -eu
+          release=$(git -C src rev-list --count HEAD)
+          sed -i -E "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$release/" "src/$PKG_PATH/Makefile"
+
+          # local feed holding just this package, so feeds install pulls its deps from base
+          mkdir feed
+          ln -s "$GITHUB_WORKSPACE/src/$PKG_PATH" "feed/$PKG"
+
+          cd sdk
+          grep -E '^src-git( --root=package)? base ' feeds.conf.default > feeds.conf
+          echo "src-link local $GITHUB_WORKSPACE/feed" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install "$PKG"
+
+          cat > .config <<EOF
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_SIGNED_PACKAGES is not set
+          CONFIG_PACKAGE_$PKG=m
+          EOF
+          make defconfig > /dev/null
+
+          make -j"$(nproc)" "package/$PKG/compile" ||
+            make -j1 V=s "package/$PKG/compile"
+
+          mkdir ../out
+          find bin/packages -path '*/local/*.apk' -exec cp {} ../out/ \;
+          ls -l ../out
+          [ -n "$(ls ../out)" ]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.arch }}
+          path: out/*.apk
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-snapshot-${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # asset names are "<arch>__<file>.apk": apk file names carry no arch
+      - name: Replace snapshot release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          mkdir assets
+          for dir in artifacts/apk-*; do
+            arch=${dir#artifacts/apk-}
+            for f in "$dir"/*.apk; do cp "$f" "assets/${arch}__$(basename "$f")"; done
+          done
+          ls -l assets
+          gh release delete snapshot --cleanup-tag --yes || true
+          gh release create snapshot assets/* --prerelease --target "$GITHUB_SHA" \
+            --title "snapshot ($(echo "$GITHUB_SHA" | cut -c1-7))" \
+            --notes "Rolling OpenWrt $OPENWRT_RELEASE build of $GITHUB_SHA. Install from the feed instead: https://${{ github.repository_owner }}.github.io/openwrt-pkgs/"
+
+      - name: Notify feed
+        env:
+          GH_TOKEN: ${{ secrets.FEED_TOKEN }}
+          FEED_REPO: ${{ inputs.feed-repo || format('{0}/openwrt-pkgs', github.repository_owner) }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::FEED_TOKEN not set; run the feed workflow in $FEED_REPO by hand"
+            exit 0
+          fi
+          gh api "repos/$FEED_REPO/dispatches" \
+            -f event_type=package-updated -f "client_payload[repo]=${{ github.repository }}"
