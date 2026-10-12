@@ -8,7 +8,7 @@ on:
     types: [package-updated]
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [trunk]
 
 permissions:
   contents: read

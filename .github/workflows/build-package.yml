@@ -5,7 +5,7 @@
 # Caller example (in sochinorth/routebot):
 #   jobs:
 #     openwrt:
-#       uses: sochinorth/openwrt-pkgs/.github/workflows/build-package.yml@main
+#       uses: sochinorth/openwrt-pkgs/.github/workflows/build-package.yml@trunk
 #       with: { package: routebot, path: openwrt/routebot }
 #       secrets: inherit
 #
