@@ -155,7 +155,7 @@ jobs:
           gh release delete snapshot --cleanup-tag --yes || true
           gh release create snapshot assets/* --prerelease --target "$GITHUB_SHA" \
             --title "snapshot ($(echo "$GITHUB_SHA" | cut -c1-7))" \
-            --notes "Rolling OpenWrt $OPENWRT_RELEASE build of $GITHUB_SHA. Install from the feed instead: https://${{ github.repository_owner }}.github.io/openwrt-pkgs/"
+            --notes "Rolling OpenWrt $OPENWRT_RELEASE build of $GITHUB_SHA. Install from the feed instead: https://sochinorth.cc/openwrt-pkgs/"
 
       - name: Notify feed
         env:

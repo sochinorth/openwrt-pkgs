@@ -2,13 +2,13 @@
 
 apk feed for [routebot](https://github.com/sochinorth/routebot) and
 [omnidns](https://github.com/sochinorth/omnidns), rebuilt on every commit to
-their default branches and served at <https://sochinorth.github.io/openwrt-pkgs/>.
+their default branches and served at <https://sochinorth.cc/openwrt-pkgs/>.
 
 ## Using it on a router (OpenWrt 25.12)
 
 ```sh
-wget -O /etc/apk/keys/sochinorth.pem https://sochinorth.github.io/openwrt-pkgs/sochinorth.pem
-echo "https://sochinorth.github.io/openwrt-pkgs/25.12/$(cat /etc/apk/arch)/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
+wget -O /etc/apk/keys/sochinorth.pem https://sochinorth.cc/openwrt-pkgs/sochinorth.pem
+echo "https://sochinorth.cc/openwrt-pkgs/25.12/$(cat /etc/apk/arch)/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
 apk update
 apk add routebot omnidns
 ```
